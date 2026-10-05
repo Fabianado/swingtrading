@@ -82,6 +82,8 @@ def run_playbook(
         sessions,
         min_dollar_volume=settings.min_dollar_volume,
         earnings_blackout_sessions=settings.earnings_blackout_sessions,
+        max_atr_pct=settings.max_atr_pct,
+        max_bar_move_pct=settings.max_bar_move_pct,
     )
     ranked = rank_setups(filtered)
     shortlist = select_finalists(ranked, settings.pre_shortlist, settings.max_per_sector)

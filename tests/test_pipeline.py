@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from swingtrading.ai.cost import CostGuard
 from swingtrading.ai.grok import AIOverlay
 from swingtrading.brokers.ibkr import IBKRRetailBroker, ensure_asyncio_loop
@@ -60,6 +62,22 @@ def test_pipeline_honors_ai_veto(ohlcv, constituents, earnings, settings) -> Non
     assert any(p.symbol == "AAA" and p.ai and p.ai.veto for p in playbook.discarded)
 
 
+def test_place_bracket_refuses_negative_target(settings, sample_plan) -> None:
+    from swingtrading.models import Side
+
+    bad = sample_plan.model_copy(
+        update={
+            "side": Side.SELL,
+            "entry_price": 11.58,
+            "stop_price": 20.02,
+            "target_price": -5.2898,
+        }
+    )
+    broker = IBKRRetailBroker(settings)
+    with pytest.raises(ValueError, match="profit-taker"):
+        broker.place_bracket(bad)
+
+
 def test_ibkr_broker_starts_disconnected(settings) -> None:
     broker = IBKRRetailBroker(settings)
     assert broker.is_connected() is False
@@ -70,8 +88,25 @@ def test_ensure_asyncio_loop_is_current() -> None:
 
     loop = ensure_asyncio_loop()
     assert loop is asyncio.get_event_loop()
+    assert loop is ensure_asyncio_loop()
     assert not loop.is_closed()
     # ib_insync's getLoop() is what failed on Python 3.12+ without this.
     from ib_insync.util import getLoop
 
     assert getLoop() is loop
+
+
+def test_probe_tws_fails_fast_on_closed_port() -> None:
+    from swingtrading.brokers.ibkr import probe_tws
+
+    with pytest.raises(ConnectionError, match="Nothing is accepting sockets"):
+        probe_tws("127.0.0.1", 1, timeout=0.3)
+
+
+def test_connect_fails_fast_when_tws_is_down(settings) -> None:
+    settings.tws_host = "127.0.0.1"
+    settings.tws_port = 1
+    settings.tws_connect_timeout = 1.0
+    broker = IBKRRetailBroker(settings)
+    with pytest.raises(ConnectionError, match="Nothing is accepting sockets"):
+        broker.connect()

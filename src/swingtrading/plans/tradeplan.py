@@ -12,6 +12,29 @@ from swingtrading.models import (
 )
 
 
+def invalid_bracket_reason(plan: TradePlan) -> str | None:
+    """Why this bracket must not be sent. None when entry, stop, and target are usable."""
+    entry = float(plan.entry_price)
+    stop = float(plan.stop_price)
+    target = float(plan.target_price)
+    if entry <= 0 or stop <= 0 or target <= 0:
+        return (
+            f"target {target:.4f} is not a valid profit-taker "
+            f"(entry {entry:.2f}, stop {stop:.2f}); not sending"
+        )
+    if plan.side is Side.BUY and not (stop < entry < target):
+        return (
+            f"long prices out of order (stop {stop:.2f}, entry {entry:.2f}, "
+            f"target {target:.2f}); not sending"
+        )
+    if plan.side is Side.SELL and not (target < entry < stop):
+        return (
+            f"short prices out of order (target {target:.2f}, entry {entry:.2f}, "
+            f"stop {stop:.2f}); not sending"
+        )
+    return None
+
+
 def round_price(price: float) -> float:
     if price >= 1:
         return round(price + 1e-12, 2)
@@ -42,7 +65,7 @@ def build_trade_plan(setup: ScoredSetup, settings: Settings) -> TradePlan | None
     qty = int(settings.risk_usd // risk)
     if qty < 1:
         return None
-    return plan.model_copy(
+    sized = plan.model_copy(
         update={
             "qty": qty,
             "risk_usd": settings.risk_usd,
@@ -58,6 +81,9 @@ def build_trade_plan(setup: ScoredSetup, settings: Settings) -> TradePlan | None
             ),
         }
     )
+    if invalid_bracket_reason(sized):
+        return None
+    return sized
 
 
 def _continuation(setup: ScoredSetup, settings: Settings) -> TradePlan | None:

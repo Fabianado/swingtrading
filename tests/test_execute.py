@@ -44,6 +44,7 @@ class FakeBroker:
         self._id = 100
         self.buying_power_usd = 1e12
         self.margins: dict[str, float] = {}
+        self.quote_calls = 0
 
     def buying_power(self) -> float:
         return float(self.buying_power_usd)
@@ -67,6 +68,7 @@ class FakeBroker:
         return self.connected
 
     def quote(self, symbol: str) -> Quote:
+        self.quote_calls += 1
         return self.quotes.get(symbol, Quote(symbol=symbol, open=100.0, last=100.0))
 
     def position_qty(self, symbol: str) -> int:
@@ -488,6 +490,37 @@ def test_waits_for_open_then_skips_gap(playbook, settings, tmp_path, sample_plan
     assert rth_has_opened(clock.now)
 
 
+def test_negative_target_is_not_transmitted(playbook, settings, tmp_path, sample_plan) -> None:
+    bad = sample_plan.model_copy(
+        update={
+            "symbol": "CTVA",
+            "side": Side.SELL,
+            "entry_price": 11.58,
+            "stop_price": 20.02,
+            "target_price": -5.2898,
+        }
+    )
+    book = playbook.model_copy(update={"picks": [bad]})
+    write_playbook(book, tmp_path)
+    settings = _settings(tmp_path, settings)
+    broker = FakeBroker()
+    broker.quotes["CTVA"] = Quote(symbol="CTVA", open=11.58, last=11.58)
+    state = execute_tickers(
+        settings,
+        ["CTVA"],
+        playbook=book,
+        broker=broker,
+        prompt_fn=broker.prompts.append,
+        now_fn=lambda: AFTER_OPEN,
+        wait_for_open=True,
+        wait_for_moc=False,
+        monitor=False,
+    )
+    assert "CTVA" in state.invalidated
+    assert broker.placed == []
+    assert any("profit-taker" in d.reason for d in state.decisions)
+
+
 def test_no_opening_print_does_not_send(playbook, settings, tmp_path, sample_plan) -> None:
     settings = _settings(tmp_path, settings)
     settings.rth_quote_timeout_seconds = 0
@@ -506,6 +539,37 @@ def test_no_opening_print_does_not_send(playbook, settings, tmp_path, sample_pla
     assert sample_plan.symbol in state.invalidated
     assert broker.placed == []
     assert any("opening print" in d.reason for d in state.decisions)
+    assert broker.quote_calls == 1
+    assert broker.wait_count == 0
+
+
+def test_yahoo_fallback_used_when_tws_has_no_tape(
+    playbook, settings, tmp_path, sample_plan
+) -> None:
+    settings = _settings(tmp_path, settings)
+    broker = FakeBroker()
+    broker.quotes[sample_plan.symbol] = Quote(symbol=sample_plan.symbol)
+    broker.fill_on_wait = [sample_plan.symbol]
+
+    def fallback(_symbol: str) -> Quote:
+        return Quote(
+            symbol=sample_plan.symbol,
+            open=sample_plan.entry_price,
+            last=sample_plan.entry_price,
+        )
+
+    state = execute_tickers(
+        settings,
+        [sample_plan.symbol],
+        playbook=playbook,
+        broker=broker,
+        prompt_fn=broker.prompts.append,
+        now_fn=lambda: AFTER_OPEN,
+        wait_for_moc=False,
+        fallback_quote=fallback,
+    )
+    assert sample_plan.symbol in broker.placed
+    assert any(d.action == "placed" for d in state.decisions)
 
 
 def test_now_flag_skips_open_wait(playbook, settings, tmp_path, sample_plan) -> None:

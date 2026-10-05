@@ -74,6 +74,7 @@ class Features(BaseModel):
     volume_ratio: float
     range_atr: float
     dist_sma20_atr: float
+    max_tr_pct: float = 0.0
     high_20: float
     low_20: float
     earnings_date: date | None = None

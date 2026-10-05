@@ -8,7 +8,7 @@ import pandas as pd
 import yfinance as yf
 
 from swingtrading.data.cache import CacheStore
-from swingtrading.models import Constituent
+from swingtrading.models import Constituent, Quote
 
 logger = logging.getLogger(__name__)
 
@@ -139,6 +139,26 @@ def _one_ohlcv(part: pd.DataFrame, symbol: str) -> pd.DataFrame:
     return out[["symbol", "date", "open", "high", "low", "close", "volume"]].dropna(
         subset=["open", "high", "low", "close"]
     )
+
+
+def yahoo_session_quote(symbol: str) -> Quote | None:
+    """Today's Yahoo daily open/last when TWS has no US tape entitlement."""
+    try:
+        hist = yf.Ticker(symbol).history(period="5d", interval="1d", auto_adjust=True)
+    except Exception:  # noqa: BLE001
+        logger.warning("Yahoo quote failed for %s", symbol, exc_info=True)
+        return None
+    if hist is None or hist.empty:
+        return None
+    row = hist.iloc[-1]
+    try:
+        open_px = float(row["Open"])
+        last_px = float(row["Close"])
+    except (TypeError, ValueError, KeyError):
+        return None
+    if open_px != open_px or last_px != last_px:
+        return None
+    return Quote(symbol=symbol, open=open_px, last=last_px)
 
 
 def _next_earnings(symbol: str) -> date | None:

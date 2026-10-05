@@ -3,14 +3,20 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import os
+import signal
+import socket
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 
 from swingtrading.config import Settings
-from swingtrading.execute.capital import fallback_margin
 from swingtrading.execute.ledger import is_swing_ref, make_order_ref
+from swingtrading.plans.tradeplan import invalid_bracket_reason
 from swingtrading.models import BracketHandle, EntryType, LedgerFill, Quote, Side, TradePlan
 
 logger = logging.getLogger(__name__)
+_LOOP: asyncio.AbstractEventLoop | None = None
 
 _FILLED = {"Filled"}
 _CANCELLED = {"Cancelled", "ApiCancelled", "Inactive"}
@@ -24,20 +30,59 @@ _WORKING = {
 
 
 def ensure_asyncio_loop() -> asyncio.AbstractEventLoop:
-    """ib_insync needs a current loop; Python 3.12+ no longer creates one."""
+    """Pin one loop for ib_insync. Python 3.12+ will not create one for us."""
+    global _LOOP
+    if _LOOP is not None and not _LOOP.is_closed():
+        asyncio.set_event_loop(_LOOP)
+        return _LOOP
     try:
-        return asyncio.get_running_loop()
+        running = asyncio.get_running_loop()
+        _LOOP = running
+        return running
     except RuntimeError:
         pass
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    _LOOP = loop
+    return loop
+
+
+def probe_tws(host: str, port: int, timeout: float = 2.0) -> None:
+    """Fail immediately if nothing is listening. Does not complete the API handshake."""
     try:
-        loop = asyncio.get_event_loop()
-        if loop.is_closed():
-            raise RuntimeError("closed")
-        return loop
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        return loop
+        with socket.create_connection((host, int(port)), timeout=timeout):
+            return
+    except OSError as exc:
+        raise ConnectionError(
+            f"Nothing is accepting sockets at {host}:{port}. "
+            "Start TWS or LYNX Gateway and enable the API socket "
+            "(Global Configuration → API → Settings)."
+        ) from exc
+
+
+def _progress(message: str) -> None:
+    logger.info("%s", message)
+    print(message, flush=True)
+
+
+@contextmanager
+def _hard_deadline(seconds: float, message: str) -> Iterator[None]:
+    """Interrupt a stuck ib_insync wait. SIGALRM is ignored on non-POSIX."""
+    if os.name != "posix" or seconds <= 0:
+        yield
+        return
+
+    def _on_alarm(_signum: int, _frame: object) -> None:
+        raise TimeoutError(message)
+
+    previous = signal.getsignal(signal.SIGALRM)
+    signal.signal(signal.SIGALRM, _on_alarm)
+    signal.setitimer(signal.ITIMER_REAL, seconds)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0.0)
+        signal.signal(signal.SIGALRM, previous)
 
 
 def _account_usd(rows: list, tag: str) -> float | None:
@@ -83,28 +128,76 @@ class IBKRRetailBroker:
 
     def connect(self) -> None:
         ensure_asyncio_loop()
-        if self.ib.isConnected():
+        if self._ib is not None and self.ib.isConnected():
             return
-        self.ib.connect(
-            self.settings.tws_host,
-            int(self.settings.tws_port),
-            clientId=int(self.settings.tws_client_id),
-            timeout=float(self.settings.tws_connect_timeout),
-            readonly=False,
+        host = self.settings.tws_host
+        port = int(self.settings.tws_port)
+        timeout = float(self.settings.tws_connect_timeout)
+        base_id = int(self.settings.tws_client_id)
+        _progress(f"Probing TWS socket {host}:{port} …")
+        probe_tws(host, port, timeout=min(2.0, timeout))
+        _progress(
+            f"TWS is listening. Handshake up to {timeout:.0f}s "
+            f"(clientId {base_id}–{base_id + 4}). "
+            "If TWS shows “Accept incoming connection attempt”, click Yes."
         )
-        # Delayed quotes if no paid US tape; order prices remain the source of truth.
+        last_error: Exception | None = None
+        for offset in range(5):
+            client_id = base_id + offset
+            self._ib = None
+            try:
+                self._handshake(host, port, client_id, timeout)
+                if offset:
+                    _progress(f"TWS handshake ok with clientId={client_id}")
+                return
+            except Exception as exc:  # noqa: BLE001
+                last_error = exc
+                logger.warning("TWS handshake clientId=%s failed: %s", client_id, exc)
+                self._abandon()
+                busy = "already in use" in str(exc).lower() or "peer closed" in str(exc).lower()
+                if not busy:
+                    break
+                _progress(f"clientId {client_id} is busy; trying {client_id + 1} …")
+        hint = (
+            f"TWS accepted the socket at {host}:{port} but the API handshake did not finish. "
+            "In TWS click Yes on any incoming-API dialog, enable ActiveX and Socket Clients, "
+            f"and free client ID {base_id} (another API session may already hold it)."
+        )
+        raise ConnectionError(f"{hint} ({last_error})") from last_error
+
+    def _handshake(self, host: str, port: int, client_id: int, timeout: float) -> None:
+        ib_log = logging.getLogger("ib_insync")
+        previous = ib_log.level
+        ib_log.setLevel(logging.INFO)
+        deadline = f"TWS handshake timed out after {timeout:.0f}s (clientId={client_id})"
+        try:
+            self.ib.RequestTimeout = timeout
+            with _hard_deadline(timeout + 2.0, deadline):
+                self.ib.connect(
+                    host,
+                    port,
+                    clientId=client_id,
+                    timeout=timeout,
+                    readonly=False,
+                )
+        except Exception as exc:  # noqa: BLE001
+            raise ConnectionError(f"{deadline}: {exc}") from exc
+        finally:
+            ib_log.setLevel(previous)
+        if not self.ib.isConnected():
+            raise ConnectionError(f"{deadline}: socket dropped after connect()")
         try:
             self.ib.reqMarketDataType(3)
         except Exception:  # noqa: BLE001
             logger.debug("reqMarketDataType(3) failed", exc_info=True)
+
+    def _abandon(self) -> None:
         try:
-            self.ib.reqAllOpenOrders()
+            if self._ib is not None:
+                self.ib.disconnect()
         except Exception:  # noqa: BLE001
-            logger.debug("reqAllOpenOrders failed", exc_info=True)
-        try:
-            self.ib.reqAccountUpdates()
-        except Exception:  # noqa: BLE001
-            logger.debug("reqAccountUpdates failed", exc_info=True)
+            logger.debug("disconnect after failed handshake", exc_info=True)
+        self._ib = None
 
     def reconnect(self) -> None:
         ensure_asyncio_loop()
@@ -130,7 +223,7 @@ class IBKRRetailBroker:
         if qualified:
             contract = qualified[0]
         ticker = self.ib.reqMktData(contract, "", snapshot=True, regulatorySnapshot=False)
-        self.ib.sleep(1.5)
+        self.ib.sleep(0.8)
         quote = Quote(
             symbol=symbol,
             last=_px(getattr(ticker, "last", None)) or _px(getattr(ticker, "delayedLast", None)),
@@ -147,6 +240,12 @@ class IBKRRetailBroker:
     def buying_power(self) -> float:
         """USD AvailableFunds, else BuyingPower. inf if TWS has not published either."""
         rows = list(self.ib.accountValues())
+        if not rows:
+            try:
+                self.ib.sleep(0.4)
+            except Exception:  # noqa: BLE001
+                pass
+            rows = list(self.ib.accountValues())
         funds = _account_usd(rows, "AvailableFunds")
         if funds is None:
             funds = _account_usd(rows, "BuyingPower")
@@ -157,6 +256,8 @@ class IBKRRetailBroker:
 
     def order_margin(self, plan: TradePlan) -> float:
         """Initial margin for the parent entry; fallback is conservative notional."""
+        from swingtrading.execute.capital import fallback_margin
+
         fallback = fallback_margin(plan, self.settings)
         try:
             from ib_insync import Order, Stock
@@ -199,6 +300,9 @@ class IBKRRetailBroker:
         return total
 
     def place_bracket(self, plan: TradePlan) -> BracketHandle:
+        broken = invalid_bracket_reason(plan)
+        if broken:
+            raise ValueError(broken)
         from ib_insync import Order, Stock
 
         contract = Stock(plan.symbol, plan.exchange, plan.currency)

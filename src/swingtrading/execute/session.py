@@ -35,15 +35,21 @@ from swingtrading.models import (
     Quote,
     TradePlan,
 )
-from swingtrading.plans.tradeplan import resize_for_risk
+from swingtrading.plans.tradeplan import invalid_bracket_reason, resize_for_risk
 
 logger = logging.getLogger(__name__)
 
 NowFn = Callable[[], datetime]
+QuoteFallback = Callable[[str], Quote | None]
 
 
 def _default_now(timezone: str) -> datetime:
     return datetime.now(ZoneInfo(timezone))
+
+
+def _say(message: str) -> None:
+    logger.info("%s", message)
+    print(message, flush=True)
 
 
 def execute_tickers(
@@ -60,6 +66,7 @@ def execute_tickers(
     wait_for_open: bool = True,
     wait_for_moc: bool = True,
     now_fn: NowFn | None = None,
+    fallback_quote: QuoteFallback | None = None,
 ) -> ExecutionState:
     """Automate saved shortlist plans for the given tickers via TWS.
 
@@ -97,6 +104,10 @@ def execute_tickers(
     gateway = broker or IBKRRetailBroker(settings)
     ask = prompt_fn if prompt_fn is not None else input
     clock = now_fn or (lambda: _default_now(settings.rth_timezone))
+    _say(
+        f"Connecting to TWS at {settings.tws_host}:{settings.tws_port} "
+        f"(clientId {settings.tws_client_id}, {settings.tws_connect_timeout:.0f}s handshake) …"
+    )
     connect_with_prompt(
         gateway,
         ask,
@@ -104,6 +115,7 @@ def execute_tickers(
         host=settings.tws_host,
         port=int(settings.tws_port),
     )
+    _say("TWS connected")
 
     if wait_for_open:
         _wait_until_rth(gateway, settings, ask, clock)
@@ -111,18 +123,30 @@ def execute_tickers(
     handles: dict[str, BracketHandle] = {}
     plans_by_symbol = {plan.symbol: plan for plan in plans}
     remaining_bp = usable_buying_power(gateway.buying_power(), settings)
-    logger.info("Usable buying power $%.0f (after reserve)", remaining_bp)
+    _say(f"Usable buying power ${remaining_bp:.0f} (after reserve)")
     placed = 0
+    session_open = rth_has_opened(
+        clock(),
+        timezone=settings.rth_timezone,
+        hour=int(settings.rth_open_hour),
+        minute=int(settings.rth_open_minute),
+    )
     for plan in plans:
         _ensure(gateway, settings, ask)
+        _say(f"Checking {plan.symbol} …")
         quote = _quote_for_gap(
             gateway,
             plan.symbol,
             settings,
             ask,
             clock,
-            wait=wait_for_open,
+            wait=wait_for_open and not session_open,
         )
+        if not has_gap_quote(quote) and fallback_quote is not None:
+            fallback = fallback_quote(plan.symbol)
+            if fallback is not None and has_gap_quote(fallback):
+                _say(f"{plan.symbol}: no TWS tape; using Yahoo open/last")
+                quote = fallback
         decision, remaining_bp, committed = _prepare_one(
             gateway,
             plan,
@@ -132,6 +156,8 @@ def execute_tickers(
             slots_left=cap - placed,
         )
         state.decisions.append(decision)
+        extra = f" {decision.qty} sh" if decision.qty else ""
+        _say(f"- {decision.symbol} {decision.action}{extra}: {decision.reason}")
         if decision.action == "invalidated":
             state.invalidated.append(plan.symbol)
         elif decision.action == "skipped":
@@ -140,7 +166,13 @@ def execute_tickers(
             placed += 1
         save_execution(state, settings.out_dir)
 
-    if monitor:
+    _say(
+        f"Done placing: opened {len(state.opened)}, "
+        f"invalidated {len(state.invalidated)}, skipped {len(state.skipped)}, "
+        f"working {len(handles)}"
+    )
+    if monitor and handles:
+        _say("Watching working entries for fills (leave TWS running; Ctrl-C keeps them working)")
         _monitor(gateway, settings, ask, state, handles, plans_by_symbol, clock)
 
     state.brackets = list(handles.values())
@@ -223,6 +255,20 @@ def _prepare_one(
     remaining_bp: float,
     slots_left: int,
 ) -> tuple[ExecutionDecision, float, bool]:
+    broken = invalid_bracket_reason(plan)
+    if broken:
+        logger.info("Skip %s: %s", plan.symbol, broken)
+        return (
+            ExecutionDecision(
+                symbol=plan.symbol,
+                action="invalidated",
+                reason=broken,
+                qty=plan.qty,
+                risk_usd=plan.risk_usd,
+            ),
+            remaining_bp,
+            False,
+        )
     held = broker.position_qty(plan.symbol)
     if held != 0:
         return (
@@ -251,6 +297,7 @@ def _prepare_one(
             False,
         )
     existing = broker.existing_bracket(plan)
+    logger.info("Estimating margin for %s", plan.symbol)
     cost = broker.order_margin(plan)
     if existing is not None:
         handles[plan.symbol] = existing

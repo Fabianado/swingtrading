@@ -4,7 +4,7 @@ from datetime import date
 
 import pandas as pd
 
-from swingtrading.features.indicators import atr, rsi, sma
+from swingtrading.features.indicators import atr, rsi, sma, true_range
 from swingtrading.models import Constituent, Features
 
 
@@ -72,6 +72,9 @@ def _last_features(
     low = hist["low"]
     volume = hist["volume"]
     atr_s = atr(high, low, close, atr_period)
+    tr_pct = true_range(high, low, close) / close.shift(1).replace(0, pd.NA)
+    recent_tr = tr_pct.iloc[-atr_period:]
+    max_tr_pct = float(recent_tr.max()) if recent_tr.notna().any() else 0.0
     sma20_s = sma(close, 20)
     sma50_s = sma(close, 50)
     rsi_s = rsi(close, 14)
@@ -120,6 +123,7 @@ def _last_features(
         volume_ratio=float(volume_ratio),
         range_atr=last_range / atr_val,
         dist_sma20_atr=(float(row["close"]) - sma20_val) / atr_val,
+        max_tr_pct=max_tr_pct,
         high_20=high_20,
         low_20=low_20,
         earnings_date=earnings,

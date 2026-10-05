@@ -11,6 +11,7 @@ from dotenv import load_dotenv
 from swingtrading.config import Settings
 from swingtrading.execute.ledger import due_fills, load_ledger, session_date
 from swingtrading.execute.moc import run_moc_job
+from swingtrading.data.yahoo import yahoo_session_quote
 from swingtrading.execute.session import execute_tickers
 from swingtrading.execute.store import load_playbook, playbook_symbols
 from swingtrading.pipeline import ingest, run_and_write
@@ -90,7 +91,9 @@ def run(
     out_dir: Path | None = typer.Option(None),
 ) -> None:
     """Screen the S&P 500, or execute saved shortlist tickers through TWS."""
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s", force=True)
+    logging.getLogger("ib_insync").setLevel(logging.WARNING)
+    logging.getLogger("ibapi").setLevel(logging.WARNING)
     load_dotenv()
     settings = _settings(
         risk_usd=risk_usd,
@@ -112,6 +115,11 @@ def run(
         if not names:
             raise typer.BadParameter("Playbook shortlist is empty; nothing to execute.")
     if names:
+        typer.echo(
+            f"Execute {', '.join(names)} via TWS {settings.tws_host}:{settings.tws_port} "
+            f"({'live' if live or int(settings.tws_port) == 7496 else 'paper'})",
+            err=False,
+        )
         try:
             state = execute_tickers(
                 settings,
@@ -121,6 +129,7 @@ def run(
                 as_of=_parse_as_of(as_of),
                 wait_for_open=not now,
                 wait_for_moc=not skip_moc,
+                fallback_quote=yahoo_session_quote,
             )
         except (FileNotFoundError, KeyError, ValueError) as exc:
             raise typer.BadParameter(str(exc)) from exc
@@ -166,7 +175,8 @@ def moc(
     Only rows in out/positions.json are touched (qty-scoped MOC). Manual
     Lynx positions are ignored.
     """
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s", force=True)
+    logging.getLogger("ib_insync").setLevel(logging.WARNING)
     load_dotenv()
     settings = _settings(
         risk_usd=None,

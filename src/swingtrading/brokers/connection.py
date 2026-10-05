@@ -28,7 +28,8 @@ def connect_with_prompt(
             return
     except Exception as exc:  # noqa: BLE001
         logger.warning("TWS connect failed: %s", exc)
-        if "event loop" in str(exc).lower():
+        text = str(exc).lower()
+        if "event loop" in text or "handshake" in text or "accept incoming" in text:
             raise
 
     message = (

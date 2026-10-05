@@ -23,6 +23,8 @@ class Settings(BaseSettings):
     min_history: int = 60
     min_dollar_volume: float = 20_000_000.0
     earnings_blackout_sessions: int = 2
+    max_atr_pct: float = 0.20
+    max_bar_move_pct: float = 0.35
 
     pre_shortlist: int = 8
     max_picks: int = 5
@@ -47,7 +49,7 @@ class Settings(BaseSettings):
     tws_host: str = "127.0.0.1"
     tws_port: int = 7497
     tws_client_id: int = 17
-    tws_connect_timeout: float = 8.0
+    tws_connect_timeout: float = 20.0
     tws_retry_seconds: float = 5.0
 
     rth_timezone: str = "America/New_York"

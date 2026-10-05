@@ -29,7 +29,7 @@ If Yahoo becomes unreliable, Tiingo Power (~$10–30/mo) is the intended paid up
 
 ### Lynx / TWS (second run only)
 
-Retail **TWS or LYNX Gateway** + socket API. Enable API (Global Configuration → API → Settings), trust `127.0.0.1`. Default port is **paper 7497**; pass `--live` for 7496. Paper login is TWS / Lynx Trading App, not LYNX+. Shorts need a **margin** account. Do not use FIX, the Client Portal Web API, IBALGOs, or fractional shares.
+Retail **TWS or LYNX Gateway** + socket API. Enable API (Global Configuration → API → Settings), trust `127.0.0.1`. If TWS shows **Accept incoming connection attempt**, click Yes or the handshake stops. Default port is **paper 7497**; pass `--live` for 7496. Client ID defaults to 17; another API window holding that ID will block connect. Paper login is TWS / Lynx Trading App, not LYNX+. Shorts need a **margin** account. Do not use FIX, the Client Portal Web API, IBALGOs, or fractional shares.
 
 ## Install
 
