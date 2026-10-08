@@ -55,6 +55,42 @@ def sessions_held(fill_date: date, today: date) -> int:
     return count
 
 
+def sessions_remaining(fill: LedgerFill, today: date) -> int:
+    """Trading sessions left, including today, if neither target nor stop is hit.
+
+    Session 1 is the fill date. The time stop flattens at the close of session
+    ``time_stop_sessions``.
+    """
+    held = sessions_held(fill.fill_date, today)
+    if held <= 0:
+        return int(fill.time_stop_sessions)
+    return max(0, int(fill.time_stop_sessions) - held + 1)
+
+
+def time_stop_lines(ledger: PositionLedger, today: date) -> list[str]:
+    """One line per open program position describing the time stop."""
+    rows = open_fills(ledger)
+    if not rows:
+        return ["No open program positions. Nothing is on a time stop."]
+    lines: list[str] = []
+    for fill in sorted(rows, key=lambda row: (row.symbol, row.order_ref)):
+        held = sessions_held(fill.fill_date, today)
+        left = sessions_remaining(fill, today)
+        side = "long" if fill.side is Side.BUY else "short"
+        if left <= 0:
+            horizon = "time stop already due"
+        elif left == 1:
+            horizon = "1 trading session left, including today"
+        else:
+            horizon = f"{left} trading sessions left, including today"
+        lines.append(
+            f"{fill.symbol} {side} {fill.qty} sh: "
+            f"session {held} of {int(fill.time_stop_sessions)}, {horizon} "
+            f"if neither target nor stop is hit"
+        )
+    return lines
+
+
 def is_due(fill: LedgerFill, today: date) -> bool:
     if fill.status != "open":
         return False
@@ -67,6 +103,27 @@ def due_fills(ledger: PositionLedger, today: date) -> list[LedgerFill]:
 
 def open_fills(ledger: PositionLedger) -> list[LedgerFill]:
     return [row for row in ledger.fills if row.status == "open"]
+
+
+def held_fills(ledger: PositionLedger, qty_of) -> list[LedgerFill]:
+    """Open ledger rows that still have shares on the program side in the account."""
+    return [row for row in open_fills(ledger) if close_qty(row, int(qty_of(row.symbol))) > 0]
+
+
+def retire_flat_fills(ledger: PositionLedger, broker) -> PositionLedger:
+    """Drop open rows whose shares and tagged exits are both gone.
+
+    A name that is flat and has no working profit-taker or stop is not printed
+    and is not eligible for a time-stop close.
+    """
+    book = ledger
+    for fill in open_fills(ledger):
+        if close_qty(fill, int(broker.position_qty(fill.symbol))) > 0:
+            continue
+        if broker.has_working_exit(fill):
+            continue
+        book = mark_status(book, fill.order_ref, "closed_elsewhere")
+    return book
 
 
 def close_qty(fill: LedgerFill, held: int) -> int:

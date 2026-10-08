@@ -469,6 +469,26 @@ class IBKRRetailBroker:
         self.ib.placeOrder(contract, order)
         self.ib.sleep(0.3)
 
+    def has_working_exit(self, fill: LedgerFill) -> bool:
+        """True when this fill's profit-taker or stop is still working at TWS."""
+        wanted_ids = {i for i in (fill.take_id, fill.stop_id) if i is not None}
+        parent_id = int(fill.parent_id or -1)
+        for trade in list(self.ib.openTrades()):
+            order = trade.order
+            oid = int(getattr(order, "orderId", -1) or -1)
+            ref = str(getattr(order, "orderRef", "") or "")
+            status = str(getattr(trade.orderStatus, "status", "") or "")
+            if status not in _WORKING:
+                continue
+            otype = str(getattr(order, "orderType", "") or "").upper()
+            if otype == "MOC" or oid == parent_id:
+                continue
+            if oid in wanted_ids:
+                return True
+            if ref == fill.order_ref and otype in {"LMT", "STP", "STP LMT"}:
+                return True
+        return False
+
     def tagged_exit_filled(self, fill: LedgerFill) -> str | None:
         """Return 'target' or 'stop' if that tagged child already filled."""
         for trade in list(self.ib.trades()):

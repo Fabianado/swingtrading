@@ -14,9 +14,12 @@ from swingtrading.execute.capital import fits_buying_power, usable_buying_power
 from swingtrading.execute.ledger import (
     due_fills,
     fill_from_plan,
+    held_fills,
     load_ledger,
+    retire_flat_fills,
     save_ledger,
     session_date,
+    time_stop_lines,
     upsert_fill,
 )
 from swingtrading.execute.moc import run_moc_job
@@ -116,6 +119,12 @@ def execute_tickers(
         port=int(settings.tws_port),
     )
     _say("TWS connected")
+    today = session_date(clock(), settings.rth_timezone)
+    book = retire_flat_fills(load_ledger(settings.out_dir), gateway)
+    save_ledger(book, settings.out_dir)
+    visible = book.model_copy(update={"fills": held_fills(book, gateway.position_qty)})
+    for line in time_stop_lines(visible, today):
+        print(line, flush=True)
 
     if wait_for_open:
         _wait_until_rth(gateway, settings, ask, clock)

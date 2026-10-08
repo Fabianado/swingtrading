@@ -33,16 +33,23 @@ class YahooClient:
 
         tickers = sorted(set(symbols))
         logger.info("Downloading OHLCV for %s symbols from Yahoo (%s → %s)", len(tickers), start, end)
-        raw = yf.download(
-            tickers=tickers,
-            start=start.isoformat(),
-            end=(end + timedelta(days=1)).isoformat(),
-            auto_adjust=True,
-            group_by="ticker",
-            threads=True,
-            progress=False,
-        )
-        frames = _normalize_download(raw, tickers)
+        frames = _download_symbols(tickers, start, end)
+        missing = _symbols_without_rows(frames, tickers)
+        if missing:
+            logger.warning(
+                "Yahoo returned no prices for %s; retrying individually",
+                ", ".join(missing),
+            )
+            retried = _download_symbols(missing, start, end)
+            if not retried.empty:
+                frames = pd.concat([frames, retried], ignore_index=True) if not frames.empty else retried
+            still_missing = _symbols_without_rows(frames, tickers)
+            if still_missing:
+                logger.warning(
+                    "Skipping %s symbol(s) with no Yahoo prices: %s",
+                    len(still_missing),
+                    ", ".join(still_missing),
+                )
         if frames.empty:
             existing = self.cache.load_ohlcv()
             if existing.empty:
@@ -93,49 +100,110 @@ def constituents_frame(items: list[Constituent]) -> pd.DataFrame:
     return pd.DataFrame([c.model_dump() for c in items])
 
 
+def _download_symbols(tickers: list[str], start: date, end: date) -> pd.DataFrame:
+    empty = pd.DataFrame(columns=["symbol", "date", "open", "high", "low", "close", "volume"])
+    if not tickers:
+        return empty
+    try:
+        raw = yf.download(
+            tickers=tickers,
+            start=start.isoformat(),
+            end=(end + timedelta(days=1)).isoformat(),
+            auto_adjust=True,
+            group_by="ticker",
+            threads=len(tickers) > 1,
+            progress=False,
+        )
+    except Exception:  # noqa: BLE001
+        if len(tickers) == 1:
+            logger.warning("Yahoo download failed for %s", tickers[0], exc_info=True)
+            return empty
+        mid = len(tickers) // 2
+        logger.warning("Yahoo batch failed for %s symbols; splitting the request", len(tickers))
+        left = _download_symbols(tickers[:mid], start, end)
+        right = _download_symbols(tickers[mid:], start, end)
+        parts = [frame for frame in (left, right) if not frame.empty]
+        return pd.concat(parts, ignore_index=True) if parts else empty
+    return _normalize_download(raw, tickers)
+
+
+def _symbols_without_rows(frames: pd.DataFrame, tickers: list[str]) -> list[str]:
+    if frames.empty or "symbol" not in frames.columns:
+        return list(tickers)
+    present = set(frames["symbol"].astype(str))
+    return [symbol for symbol in tickers if symbol not in present]
+
+
 def _normalize_download(raw: pd.DataFrame, tickers: list[str]) -> pd.DataFrame:
+    empty = pd.DataFrame(columns=["symbol", "date", "open", "high", "low", "close", "volume"])
     if raw is None or raw.empty:
-        return pd.DataFrame(columns=["symbol", "date", "open", "high", "low", "close", "volume"])
+        return empty
     frames: list[pd.DataFrame] = []
     if isinstance(raw.columns, pd.MultiIndex):
         level0 = set(raw.columns.get_level_values(0))
-        if "Close" in level0 or "close" in {str(x).title() for x in level0}:
-            # group_by=column: top level is OHLCV
-            for symbol in tickers:
+        grouped_by_column = "Close" in level0 or "close" in {str(x).title() for x in level0}
+        for symbol in tickers:
+            if grouped_by_column:
                 if symbol not in raw.columns.get_level_values(1):
                     continue
                 part = raw.xs(symbol, axis=1, level=1, drop_level=True)
-                frames.append(_one_ohlcv(part, symbol))
-        else:
-            for symbol in tickers:
+            else:
                 if symbol not in level0:
                     continue
                 part = raw[symbol]
-                frames.append(_one_ohlcv(part, symbol))
+            frames.append(_safe_ohlcv(part, symbol))
     else:
         symbol = tickers[0] if len(tickers) == 1 else "UNKNOWN"
-        frames.append(_one_ohlcv(raw, symbol))
+        frames.append(_safe_ohlcv(raw, symbol))
+    frames = [frame for frame in frames if not frame.empty]
     if not frames:
-        return pd.DataFrame(columns=["symbol", "date", "open", "high", "low", "close", "volume"])
+        return empty
     return pd.concat(frames, ignore_index=True)
 
 
-def _one_ohlcv(part: pd.DataFrame, symbol: str) -> pd.DataFrame:
-    df = part.copy()
-    df.columns = [str(c).strip().lower().replace(" ", "_") for c in df.columns]
-    rename = {"adj_close": "close"}
-    df = df.rename(columns=rename)
-    needed = {"open", "high", "low", "close", "volume"}
-    if not needed.issubset(df.columns):
+def _safe_ohlcv(part: pd.DataFrame, symbol: str) -> pd.DataFrame:
+    try:
+        return _one_ohlcv(part, symbol)
+    except Exception:  # noqa: BLE001
+        logger.warning("Skipping unreadable Yahoo frame for %s", symbol, exc_info=True)
         return pd.DataFrame(columns=["symbol", "date", "open", "high", "low", "close", "volume"])
+
+
+def _one_ohlcv(part: pd.DataFrame, symbol: str) -> pd.DataFrame:
+    empty = pd.DataFrame(columns=["symbol", "date", "open", "high", "low", "close", "volume"])
+    df = part.copy()
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(-1)
+    df.columns = [str(c).strip().lower().replace(" ", "_") for c in df.columns]
+    if df.columns.duplicated().any():
+        df = df.loc[:, ~df.columns.duplicated()].copy()
+    # Failed Yahoo replies include both Close and Adj Close. Renaming both
+    # to close makes a 2-d column and crashes the rest of the download.
+    if "close" in df.columns and "adj_close" in df.columns:
+        df = df.drop(columns=["adj_close"])
+    elif "adj_close" in df.columns:
+        df = df.rename(columns={"adj_close": "close"})
+    needed = {"open", "high", "low", "close", "volume"}
+    if not needed.issubset(set(df.columns)):
+        return empty
     out = df[list(needed)].dropna(subset=["close"]).reset_index()
+    if out.empty:
+        return empty
     date_col = "date" if "date" in out.columns else out.columns[0]
     out = out.rename(columns={date_col: "date"})
-    out["date"] = pd.to_datetime(out["date"]).dt.tz_localize(None).dt.normalize()
+    if isinstance(out["date"], pd.DataFrame):
+        out = out.loc[:, ~out.columns.duplicated()].copy()
+    out["date"] = pd.to_datetime(out["date"], errors="coerce").dt.tz_localize(None).dt.normalize()
     out["symbol"] = symbol
-    out["volume"] = pd.to_numeric(out["volume"], errors="coerce").fillna(0)
+    volume = out["volume"]
+    if isinstance(volume, pd.DataFrame):
+        volume = volume.iloc[:, 0]
+    out["volume"] = pd.to_numeric(volume, errors="coerce").fillna(0)
     for col in ("open", "high", "low", "close"):
-        out[col] = pd.to_numeric(out[col], errors="coerce")
+        values = out[col]
+        if isinstance(values, pd.DataFrame):
+            values = values.iloc[:, 0]
+        out[col] = pd.to_numeric(values, errors="coerce")
     return out[["symbol", "date", "open", "high", "low", "close", "volume"]].dropna(
         subset=["open", "high", "low", "close"]
     )

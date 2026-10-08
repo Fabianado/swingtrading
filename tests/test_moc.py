@@ -50,6 +50,9 @@ class FakeMocBroker:
     def tagged_exit_filled(self, fill: LedgerFill) -> str | None:
         return self.exit_filled.get(fill.symbol)
 
+    def has_working_exit(self, fill: LedgerFill) -> bool:
+        return False
+
 
 def _due_fill(symbol: str = "MCD", side: Side = Side.SELL, qty: int = 24) -> LedgerFill:
     return LedgerFill(

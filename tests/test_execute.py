@@ -97,6 +97,9 @@ class FakeBroker:
     def tagged_exit_filled(self, fill) -> str | None:
         return None
 
+    def has_working_exit(self, fill) -> bool:
+        return False
+
     def cancel_bracket(self, handle: BracketHandle) -> None:
         self.canceled.append(handle.symbol)
         self.brackets[handle.symbol] = handle.model_copy(update={"status": "cancelled"})

@@ -13,10 +13,13 @@ from swingtrading.data.rth import format_wait, moc_window_open, past_moc_cutoff,
 from swingtrading.execute.ledger import (
     close_qty,
     due_fills,
+    held_fills,
     load_ledger,
     mark_status,
+    retire_flat_fills,
     save_ledger,
     session_date,
+    time_stop_lines,
 )
 from swingtrading.models import LedgerFill, PositionLedger
 
@@ -58,6 +61,19 @@ def run_moc_job(
             host=settings.tws_host,
             port=int(settings.tws_port),
         )
+    book = retire_flat_fills(book, gateway)
+    save_ledger(book, settings.out_dir)
+    due = [
+        fill
+        for fill in due_fills(book, today)
+        if close_qty(fill, gateway.position_qty(fill.symbol)) > 0
+    ]
+    visible = book.model_copy(update={"fills": held_fills(book, gateway.position_qty)})
+    for line in time_stop_lines(visible, today):
+        print(line, flush=True)
+    if not due:
+        logger.info("No open program positions are due for a time-stop MOC")
+        return book
 
     if wait and not ignore_window:
         if not _wait_until_moc(gateway, settings, ask, clock):
