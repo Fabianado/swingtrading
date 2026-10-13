@@ -1,19 +1,21 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pytest
 
 from swingtrading.data.rth import rth_has_opened
-from swingtrading.execute.ledger import load_ledger, make_order_ref
+from swingtrading.execute.ledger import load_ledger, make_order_ref, save_ledger
 from swingtrading.execute.session import execute_tickers
 from swingtrading.execute.store import load_playbook, playbook_symbols, save_execution
 from swingtrading.models import (
     BracketHandle,
     ExecutionState,
+    LedgerFill,
     Playbook,
+    PositionLedger,
     Quote,
     Side,
     TradePlan,
@@ -720,3 +722,55 @@ def test_position_cap_does_not_transmit_lower_confidence(
     )
     assert broker.placed == [sample_plan.symbol]
     assert set(state.skipped) >= {"BBB", "CCC"}
+
+
+def test_time_stop_closes_while_a_new_entry_is_still_working(
+    playbook, settings, tmp_path, sample_plan
+) -> None:
+    settings = _settings(tmp_path, settings)
+    due = LedgerFill(
+        symbol="PNC",
+        side=Side.SELL,
+        qty=83,
+        fill_date=date(2024, 6, 24),
+        time_stop_sessions=5,
+        parent_id=139,
+        take_id=140,
+        stop_id=141,
+        order_ref=make_order_ref(date(2024, 6, 21), "PNC"),
+    )
+    save_ledger(PositionLedger(fills=[due]), tmp_path)
+    broker = FakeBroker()
+    broker.positions["PNC"] = -83
+    broker.quotes[sample_plan.symbol] = Quote(
+        symbol=sample_plan.symbol,
+        open=sample_plan.entry_price,
+        last=sample_plan.entry_price,
+    )
+    clock = _Clock(datetime(2024, 6, 28, 15, 44, tzinfo=ET))
+    original_wait = broker.wait
+
+    def wait(seconds: float) -> None:
+        original_wait(seconds)
+        if any(str(item).startswith("MOC:") for item in broker.placed):
+            clock.now = datetime(2024, 6, 28, 16, 10, tzinfo=ET)
+            for symbol, handle in list(broker.brackets.items()):
+                broker.brackets[symbol] = handle.model_copy(update={"status": "cancelled"})
+            return
+        clock.now = clock.now + timedelta(seconds=30)
+        if broker.wait_count > 40:
+            raise AssertionError("monitor did not close the due position")
+
+    broker.wait = wait  # type: ignore[method-assign]
+    execute_tickers(
+        settings,
+        [sample_plan.symbol],
+        playbook=playbook,
+        broker=broker,
+        prompt_fn=broker.prompts.append,
+        now_fn=clock,
+        wait_for_open=False,
+        wait_for_moc=True,
+    )
+    assert any(str(item).startswith("MOC:PNC:") for item in broker.placed)
+    assert load_ledger(tmp_path).fills[0].status == "flattened"

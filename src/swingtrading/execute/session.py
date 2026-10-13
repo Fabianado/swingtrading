@@ -9,7 +9,7 @@ from swingtrading.brokers.connection import PromptFn, connect_with_prompt, recov
 from swingtrading.brokers.ibkr import IBKRRetailBroker
 from swingtrading.brokers.protocol import Broker
 from swingtrading.config import Settings
-from swingtrading.data.rth import format_wait, rth_has_opened, seconds_until_rth_open
+from swingtrading.data.rth import format_wait, moc_window_open, rth_has_opened, seconds_until_rth_open
 from swingtrading.execute.capital import fits_buying_power, usable_buying_power
 from swingtrading.execute.ledger import (
     due_fills,
@@ -182,7 +182,16 @@ def execute_tickers(
     )
     if monitor and handles:
         _say("Watching working entries for fills (leave TWS running; Ctrl-C keeps them working)")
-        _monitor(gateway, settings, ask, state, handles, plans_by_symbol, clock)
+        _monitor(
+            gateway,
+            settings,
+            ask,
+            state,
+            handles,
+            plans_by_symbol,
+            clock,
+            wait_for_moc=wait_for_moc,
+        )
 
     state.brackets = list(handles.values())
     save_execution(state, settings.out_dir)
@@ -385,6 +394,17 @@ def _prepare_one(
     )
 
 
+def _in_moc_window(settings: Settings, now_fn: NowFn) -> bool:
+    return moc_window_open(
+        now_fn(),
+        timezone=settings.rth_timezone,
+        hour=int(settings.rth_moc_hour),
+        minute=int(settings.rth_moc_minute),
+        cutoff_hour=int(settings.rth_moc_cutoff_hour),
+        cutoff_minute=int(settings.rth_moc_cutoff_minute),
+    )
+
+
 def _monitor(
     broker: Broker,
     settings: Settings,
@@ -393,11 +413,25 @@ def _monitor(
     handles: dict[str, BracketHandle],
     plans_by_symbol: dict[str, TradePlan],
     now_fn: NowFn,
+    *,
+    wait_for_moc: bool,
 ) -> None:
     if not handles:
         return
+    moc_sent = False
     while True:
         _ensure(broker, settings, prompt_fn)
+        if wait_for_moc and not moc_sent and _in_moc_window(settings, now_fn):
+            _say("Time-stop window open; closing due positions")
+            run_moc_job(
+                settings,
+                broker=broker,
+                prompt_fn=prompt_fn,
+                now_fn=now_fn,
+                wait=False,
+                ignore_window=True,
+            )
+            moc_sent = True
         opened: list[str] = []
         working: list[str] = []
         for symbol, handle in list(handles.items()):
