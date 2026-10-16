@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from swingtrading.features.compute import build_features
-from swingtrading.screen.scoring import best_setup, rank_setups, select_finalists
+from swingtrading.screen.scoring import best_setup, rank_by_side, rank_setups, select_finalists
 from swingtrading.models import SetupType, Side
 
 
@@ -20,6 +20,18 @@ def test_downtrend_scores_short(ohlcv, constituents, as_of) -> None:
     setup = best_setup(ccc)
     assert setup.side is Side.SELL
     assert setup.quant_score >= 30
+
+
+def test_rank_by_side_keeps_a_symbol_on_one_side(ohlcv, constituents, as_of) -> None:
+    features = build_features(ohlcv, constituents, as_of, earnings_by_symbol={})
+    longs, shorts = rank_by_side(features, min_score=1.0)
+    long_symbols = {setup.features.symbol for setup in longs}
+    short_symbols = {setup.features.symbol for setup in shorts}
+    assert long_symbols.isdisjoint(short_symbols)
+    assert "AAA" in long_symbols
+    assert "CCC" in short_symbols
+    assert all(setup.side is Side.BUY for setup in longs)
+    assert all(setup.side is Side.SELL for setup in shorts)
 
 
 def test_sector_cap_limits_finalists(ohlcv, constituents, as_of) -> None:

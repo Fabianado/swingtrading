@@ -4,6 +4,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from swingtrading.data.rth import (
+    cash_session_over,
     format_wait,
     moc_window_open,
     next_rth_open,
@@ -28,6 +29,12 @@ def test_weekday_at_open_is_open() -> None:
     now = datetime(2024, 6, 28, 9, 30, tzinfo=ET)
     assert rth_has_opened(now) is True
     assert seconds_until_rth_open(now) == 0
+
+
+def test_cash_session_is_over_at_the_close_and_on_weekends() -> None:
+    assert cash_session_over(datetime(2024, 6, 28, 15, 59, tzinfo=ET)) is False
+    assert cash_session_over(datetime(2024, 6, 28, 16, 0, tzinfo=ET)) is True
+    assert cash_session_over(datetime(2024, 6, 29, 10, 0, tzinfo=ET)) is True
 
 
 def test_friday_afternoon_counts_as_open() -> None:

@@ -33,14 +33,18 @@ def test_pipeline_skip_ai_writes_ranked_picks(ohlcv, constituents, earnings, set
         earnings=earnings,
     )
     assert playbook.skip_ai is True
-    assert 1 <= len(playbook.picks) <= 5
-    sectors: dict[str, int] = {}
+    assert 1 <= len(playbook.picks) <= 6
+    by_side: dict[str, int] = {}
+    by_side_sector: dict[tuple[str, str], int] = {}
     for plan in playbook.picks:
         assert plan.qty >= 1
         assert plan.entry_price > 0
         assert plan.stop_price != plan.entry_price
-        sectors[plan.sector] = sectors.get(plan.sector, 0) + 1
-        assert sectors[plan.sector] <= 2
+        by_side[plan.side] = by_side.get(plan.side, 0) + 1
+        assert by_side[plan.side] <= 3
+        key = (plan.side, plan.sector)
+        by_side_sector[key] = by_side_sector.get(key, 0) + 1
+        assert by_side_sector[key] <= 2
     symbols = [p.symbol for p in playbook.picks]
     assert "EEE" not in symbols
     assert "FFF" not in symbols

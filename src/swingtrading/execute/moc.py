@@ -5,7 +5,12 @@ from collections.abc import Callable
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from swingtrading.brokers.connection import PromptFn, connect_with_prompt, recover_connection
+from swingtrading.brokers.connection import (
+    PromptFn,
+    connect_with_prompt,
+    recover_connection,
+    session_over_checker,
+)
 from swingtrading.brokers.ibkr import IBKRRetailBroker
 from swingtrading.brokers.protocol import Broker
 from swingtrading.config import Settings
@@ -60,6 +65,7 @@ def run_moc_job(
             retry_seconds=settings.tws_retry_seconds,
             host=settings.tws_host,
             port=int(settings.tws_port),
+            session_over_fn=session_over_checker(settings, clock),
         )
     book = retire_flat_fills(book, gateway)
     save_ledger(book, settings.out_dir)
@@ -192,7 +198,14 @@ def _flatten_one(broker: Broker, ledger: PositionLedger, fill: LedgerFill) -> Po
 def _ensure(broker: Broker, settings: Settings, prompt_fn: PromptFn) -> None:
     if broker.is_connected():
         return
-    recover_connection(broker, retry_seconds=settings.tws_retry_seconds)
+    over = session_over_checker(settings)
+    recover_connection(
+        broker,
+        retry_seconds=settings.tws_retry_seconds,
+        host=settings.tws_host,
+        port=int(settings.tws_port),
+        session_over_fn=over,
+    )
     if not broker.is_connected():
         connect_with_prompt(
             broker,
@@ -200,4 +213,5 @@ def _ensure(broker: Broker, settings: Settings, prompt_fn: PromptFn) -> None:
             retry_seconds=settings.tws_retry_seconds,
             host=settings.tws_host,
             port=int(settings.tws_port),
+            session_over_fn=over,
         )

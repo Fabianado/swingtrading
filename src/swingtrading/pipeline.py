@@ -19,11 +19,11 @@ from swingtrading.data.calendar import as_of_from_bars, session_index
 from swingtrading.data.wikipedia import fetch_sp500
 from swingtrading.data.yahoo import YahooClient, constituents_frame
 from swingtrading.features.compute import build_features
-from swingtrading.models import Constituent, Playbook, TradePlan
+from swingtrading.models import Constituent, Playbook, Side, TradePlan
 from swingtrading.plans.tradeplan import build_trade_plan
 from swingtrading.report.render import write_playbook
 from swingtrading.screen.filters import apply_hard_filters
-from swingtrading.screen.scoring import rank_setups, select_finalists
+from swingtrading.screen.scoring import rank_by_side, select_finalists
 
 logger = logging.getLogger(__name__)
 
@@ -85,8 +85,11 @@ def run_playbook(
         max_atr_pct=settings.max_atr_pct,
         max_bar_move_pct=settings.max_bar_move_pct,
     )
-    ranked = rank_setups(filtered)
-    shortlist = select_finalists(ranked, settings.pre_shortlist, settings.max_per_sector)
+    longs, shorts = rank_by_side(filtered, min_score=settings.min_setup_score)
+    ranked = longs + shorts
+    shortlist = select_finalists(longs, settings.ai_per_side, settings.max_per_sector) + select_finalists(
+        shorts, settings.ai_per_side, settings.max_per_sector
+    )
 
     plans: list[TradePlan] = []
     for setup in shortlist:
@@ -107,12 +110,21 @@ def run_playbook(
         enriched.append(updated)
 
     enriched.sort(key=lambda p: p.confidence, reverse=True)
-    picks = _cap_plans(enriched, settings.max_picks, settings.max_per_sector)
+    picks = _cap_plans(
+        [p for p in enriched if p.side is Side.BUY],
+        settings.picks_per_side,
+        settings.max_per_sector,
+    ) + _cap_plans(
+        [p for p in enriched if p.side is Side.SELL],
+        settings.picks_per_side,
+        settings.max_per_sector,
+    )
+    picks.sort(key=lambda p: p.confidence, reverse=True)
     leftover = [p for p in enriched if p.symbol not in {x.symbol for x in picks}]
     discarded.extend(leftover)
 
     notes = (
-        "Quant screen on the full S&P 500; Grok news/X overlay only on the shortlist. "
+        "Quant screen on the full S&P 500; Grok sees the top five longs and the top five shorts. "
         "Entry/stop/target are ATR math, not model-invented prices."
     )
     if guard.skipped:

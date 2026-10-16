@@ -82,6 +82,49 @@ def best_setup(feat: Features) -> ScoredSetup:
     )
 
 
+def best_for_side(feat: Features, side: Side) -> ScoredSetup:
+    """Best continuation or mean-reversion score on one side."""
+    if side is Side.BUY:
+        choices = [
+            (SetupType.CONTINUATION, *score_continuation_long(feat)),
+            (SetupType.MEAN_REVERSION, *score_mean_reversion_long(feat)),
+        ]
+    else:
+        choices = [
+            (SetupType.CONTINUATION, *score_continuation_short(feat)),
+            (SetupType.MEAN_REVERSION, *score_mean_reversion_short(feat)),
+        ]
+    setup, score, why = max(choices, key=lambda item: item[1])
+    return ScoredSetup(
+        features=feat,
+        side=side,
+        setup_type=setup,
+        quant_score=round(float(score), 2),
+        rationale=why,
+    )
+
+
+def rank_by_side(
+    features: list[Features],
+    min_score: float = 35.0,
+) -> tuple[list[ScoredSetup], list[ScoredSetup]]:
+    """One list of longs and one of shorts. A symbol is kept on its better side only."""
+    longs: list[ScoredSetup] = []
+    shorts: list[ScoredSetup] = []
+    for feat in features:
+        long_setup = best_for_side(feat, Side.BUY)
+        short_setup = best_for_side(feat, Side.SELL)
+        if long_setup.quant_score < min_score and short_setup.quant_score < min_score:
+            continue
+        if long_setup.quant_score >= short_setup.quant_score and long_setup.quant_score >= min_score:
+            longs.append(long_setup)
+        elif short_setup.quant_score >= min_score:
+            shorts.append(short_setup)
+    longs.sort(key=lambda s: s.quant_score, reverse=True)
+    shorts.sort(key=lambda s: s.quant_score, reverse=True)
+    return longs, shorts
+
+
 def rank_setups(features: list[Features], min_score: float = 35.0) -> list[ScoredSetup]:
     ranked = [best_setup(f) for f in features]
     ranked = [s for s in ranked if s.quant_score >= min_score]

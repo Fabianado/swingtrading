@@ -1,0 +1,11 @@
+[Unit]
+Description=Run the swingtrading overnight playbook at 06:00 America/New_York
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 06:00:00 America/New_York
+Persistent=true
+AccuracySec=1min
+Unit=swingtrading-overnight.service
+
+[Install]
+WantedBy=timers.target

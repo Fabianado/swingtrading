@@ -28,6 +28,9 @@ class Settings(BaseSettings):
 
     pre_shortlist: int = 8
     max_picks: int = 5
+    ai_per_side: int = 5
+    picks_per_side: int = 3
+    min_setup_score: float = 35.0
     max_per_sector: int = 2
 
     risk_usd: float = 500.0
@@ -55,6 +58,8 @@ class Settings(BaseSettings):
     rth_timezone: str = "America/New_York"
     rth_open_hour: int = 9
     rth_open_minute: int = 30
+    rth_close_hour: int = 16
+    rth_close_minute: int = 0
     rth_preopen_poll_seconds: float = 30.0
     rth_poll_seconds: float = 5.0
     rth_quote_timeout_seconds: float = 900.0

@@ -1,0 +1,14 @@
+[Unit]
+Description=Swingtrading TWS session
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/fymoney/swingtrading
+Environment=PATH=%h/fymoney/swingtrading/.venv/bin:/usr/local/bin:/usr/bin:/bin
+Environment=SWINGTRADING_UNATTENDED=1
+ExecStart=/bin/bash %h/fymoney/swingtrading/trading
+TimeoutStartSec=infinity
+StandardOutput=journal
+StandardError=journal

@@ -1,0 +1,11 @@
+[Unit]
+Description=Start the swingtrading TWS session at 08:00 America/New_York
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 08:00:00 America/New_York
+Persistent=false
+AccuracySec=1min
+Unit=swingtrading-trading.service
+
+[Install]
+WantedBy=timers.target

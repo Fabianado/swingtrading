@@ -20,6 +20,20 @@ def rth_open_time(hour: int = 9, minute: int = 30) -> time:
     return time(hour=hour, minute=minute)
 
 
+def cash_session_over(
+    now: datetime,
+    *,
+    timezone: str = "America/New_York",
+    hour: int = 16,
+    minute: int = 0,
+) -> bool:
+    """True after the cash close, and all day on weekends."""
+    et = to_nyse(now, timezone)
+    if et.weekday() >= 5:
+        return True
+    return et.time() >= time(hour=hour, minute=minute)
+
+
 def rth_has_opened(
     now: datetime,
     *,

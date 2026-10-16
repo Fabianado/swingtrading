@@ -5,7 +5,12 @@ from collections.abc import Callable
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
-from swingtrading.brokers.connection import PromptFn, connect_with_prompt, recover_connection
+from swingtrading.brokers.connection import (
+    PromptFn,
+    connect_with_prompt,
+    recover_connection,
+    session_over_checker,
+)
 from swingtrading.brokers.ibkr import IBKRRetailBroker
 from swingtrading.brokers.protocol import Broker
 from swingtrading.config import Settings
@@ -34,8 +39,10 @@ from swingtrading.models import (
     BracketHandle,
     ExecutionDecision,
     ExecutionState,
+    LedgerFill,
     Playbook,
     Quote,
+    Side,
     TradePlan,
 )
 from swingtrading.plans.tradeplan import invalid_bracket_reason, resize_for_risk
@@ -44,6 +51,38 @@ logger = logging.getLogger(__name__)
 
 NowFn = Callable[[], datetime]
 QuoteFallback = Callable[[str], Quote | None]
+
+
+def _pop_next_plan(
+    queues: dict[Side, list[TradePlan]],
+    placed_by_side: dict[Side, int],
+) -> TradePlan | None:
+    """Next name to check. The side with fewer sent orders goes first; ties use confidence."""
+    buy = queues[Side.BUY]
+    sell = queues[Side.SELL]
+    if not buy and not sell:
+        return None
+    if not sell or (buy and placed_by_side[Side.BUY] < placed_by_side[Side.SELL]):
+        return buy.pop(0)
+    if not buy or placed_by_side[Side.SELL] < placed_by_side[Side.BUY]:
+        return sell.pop(0)
+    if buy[0].confidence >= sell[0].confidence:
+        return buy.pop(0)
+    return sell.pop(0)
+
+
+def _widens_side_gap(side: Side, longs: int, shorts: int) -> bool:
+    """True when this side already leads by 2 or more and another order would widen that."""
+    if side is Side.BUY:
+        return longs - shorts >= 2
+    return shorts - longs >= 2
+
+
+def _playbook_side_counts(fills: list[LedgerFill]) -> tuple[int, int]:
+    """Held playbook fills only. Manual account positions are not included."""
+    longs = sum(1 for fill in fills if fill.side is Side.BUY)
+    shorts = sum(1 for fill in fills if fill.side is Side.SELL)
+    return longs, shorts
 
 
 def _default_now(timezone: str) -> datetime:
@@ -93,6 +132,11 @@ def execute_tickers(
             )
         plans.append(resized)
     plans.sort(key=lambda p: p.confidence, reverse=True)
+    queues: dict[Side, list[TradePlan]] = {
+        Side.BUY: [p for p in plans if p.side is Side.BUY],
+        Side.SELL: [p for p in plans if p.side is Side.SELL],
+    }
+    placed_by_side = {Side.BUY: 0, Side.SELL: 0}
 
     cap = max_new_positions if max_new_positions is not None else len(plans)
     if cap < 1:
@@ -117,6 +161,7 @@ def execute_tickers(
         retry_seconds=settings.tws_retry_seconds,
         host=settings.tws_host,
         port=int(settings.tws_port),
+        session_over_fn=session_over_checker(settings, clock),
     )
     _say("TWS connected")
     today = session_date(clock(), settings.rth_timezone)
@@ -134,13 +179,18 @@ def execute_tickers(
     remaining_bp = usable_buying_power(gateway.buying_power(), settings)
     _say(f"Usable buying power ${remaining_bp:.0f} (after reserve)")
     placed = 0
+    open_long, open_short = _playbook_side_counts(visible.fills)
+    _say(f"Playbook positions: {open_long} long, {open_short} short")
     session_open = rth_has_opened(
         clock(),
         timezone=settings.rth_timezone,
         hour=int(settings.rth_open_hour),
         minute=int(settings.rth_open_minute),
     )
-    for plan in plans:
+    while True:
+        plan = _pop_next_plan(queues, placed_by_side)
+        if plan is None:
+            break
         _ensure(gateway, settings, ask)
         _say(f"Checking {plan.symbol} …")
         quote = _quote_for_gap(
@@ -163,6 +213,8 @@ def execute_tickers(
             quote,
             remaining_bp=remaining_bp,
             slots_left=cap - placed,
+            open_long=open_long + placed_by_side[Side.BUY],
+            open_short=open_short + placed_by_side[Side.SELL],
         )
         state.decisions.append(decision)
         extra = f" {decision.qty} sh" if decision.qty else ""
@@ -173,6 +225,7 @@ def execute_tickers(
             state.skipped.append(plan.symbol)
         if committed:
             placed += 1
+            placed_by_side[plan.side] += 1
         save_execution(state, settings.out_dir)
 
     _say(
@@ -272,6 +325,8 @@ def _prepare_one(
     *,
     remaining_bp: float,
     slots_left: int,
+    open_long: int = 0,
+    open_short: int = 0,
 ) -> tuple[ExecutionDecision, float, bool]:
     broken = invalid_bracket_reason(plan)
     if broken:
@@ -332,12 +387,33 @@ def _prepare_one(
             True,
         )
     if slots_left <= 0:
-        logger.info("Skip %s: position cap already allocated to higher-confidence names", plan.symbol)
+        logger.info("Skip %s: new-position cap is already filled", plan.symbol)
         return (
             ExecutionDecision(
                 symbol=plan.symbol,
                 action="skipped",
-                reason="not transmitted; higher-confidence names already filled the position cap",
+                reason="not transmitted; the new-position cap is already filled",
+                qty=plan.qty,
+                risk_usd=plan.risk_usd,
+            ),
+            remaining_bp,
+            False,
+        )
+    if _widens_side_gap(plan.side, open_long, open_short):
+        logger.info(
+            "Skip %s: %s long and %s short already open or sent",
+            plan.symbol,
+            open_long,
+            open_short,
+        )
+        return (
+            ExecutionDecision(
+                symbol=plan.symbol,
+                action="skipped",
+                reason=(
+                    f"not transmitted; {open_long} long and {open_short} short already "
+                    f"open or sent, another {plan.side.value} would widen that gap"
+                ),
                 qty=plan.qty,
                 risk_usd=plan.risk_usd,
             ),
@@ -498,7 +574,14 @@ def _record_fill(
 def _ensure(broker: Broker, settings: Settings, prompt_fn: PromptFn) -> None:
     if broker.is_connected():
         return
-    recover_connection(broker, retry_seconds=settings.tws_retry_seconds)
+    over = session_over_checker(settings)
+    recover_connection(
+        broker,
+        retry_seconds=settings.tws_retry_seconds,
+        host=settings.tws_host,
+        port=int(settings.tws_port),
+        session_over_fn=over,
+    )
     if not broker.is_connected():
         connect_with_prompt(
             broker,
@@ -506,4 +589,5 @@ def _ensure(broker: Broker, settings: Settings, prompt_fn: PromptFn) -> None:
             retry_seconds=settings.tws_retry_seconds,
             host=settings.tws_host,
             port=int(settings.tws_port),
+            session_over_fn=over,
         )

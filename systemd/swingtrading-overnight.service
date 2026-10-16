@@ -1,0 +1,13 @@
+[Unit]
+Description=Swingtrading overnight playbook
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/fymoney/swingtrading
+Environment=PATH=%h/fymoney/swingtrading/.venv/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/bin/bash %h/fymoney/swingtrading/overnight
+TimeoutStartSec=infinity
+StandardOutput=journal
+StandardError=journal

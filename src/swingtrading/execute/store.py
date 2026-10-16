@@ -54,7 +54,7 @@ def playbook_risk_usd(playbook: Playbook, fallback: float) -> float:
 
 
 def playbook_symbols(playbook: Playbook) -> list[str]:
-    """Shortlist symbols in playbook order (execute re-sorts by confidence)."""
+    """Shortlist symbols in playbook order. Execute balances the two sides, then uses confidence."""
     return [plan.symbol for plan in playbook.picks]
 
 

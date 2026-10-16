@@ -698,6 +698,158 @@ def test_does_not_transmit_more_than_buying_power(
     assert "BBB" in state.skipped
 
 
+def _short_plan(sample_plan: TradePlan, symbol: str, confidence: float) -> TradePlan:
+    return sample_plan.model_copy(
+        update={
+            "symbol": symbol,
+            "side": Side.SELL,
+            "confidence": confidence,
+            "entry_price": 100.0,
+            "stop_price": 110.0,
+            "target_price": 80.0,
+            "qty": 10,
+            "skip_if": sample_plan.skip_if.model_copy(
+                update={"open_beyond": 70.0, "description": "skip if already extended down"}
+            ),
+        }
+    )
+
+
+def test_transmit_takes_the_lagging_side_before_another_leader(
+    playbook, settings, tmp_path, sample_plan
+) -> None:
+    settings = _settings(tmp_path, settings)
+    high = _short_plan(sample_plan, "SSS", 95.0)
+    mid = _short_plan(sample_plan, "TTT", 90.0)
+    low = _short_plan(sample_plan, "UUU", 85.0)
+    long = sample_plan.model_copy(update={"confidence": 40.0})
+    book = playbook.model_copy(update={"picks": [high, mid, low, long]})
+    write_playbook(book, tmp_path)
+    broker = FakeBroker()
+    for plan in (high, mid, low, long):
+        broker.quotes[plan.symbol] = _valid_quote(plan)
+    execute_tickers(
+        settings,
+        ["SSS", "TTT", "UUU", long.symbol],
+        max_new_positions=2,
+        playbook=book,
+        broker=broker,
+        prompt_fn=broker.prompts.append,
+        now_fn=lambda: AFTER_OPEN,
+        monitor=False,
+        wait_for_open=False,
+        wait_for_moc=False,
+    )
+    assert broker.placed == ["SSS", long.symbol]
+
+
+def test_lagging_side_that_does_not_fit_does_not_block_the_other(
+    playbook, settings, tmp_path, sample_plan
+) -> None:
+    settings = _settings(tmp_path, settings)
+    settings.bp_reserve_pct = 0.0
+    high = _short_plan(sample_plan, "SSS", 95.0)
+    nxt = _short_plan(sample_plan, "TTT", 90.0)
+    long = sample_plan.model_copy(update={"confidence": 40.0})
+    book = playbook.model_copy(update={"picks": [high, nxt, long]})
+    write_playbook(book, tmp_path)
+    broker = FakeBroker()
+    broker.buying_power_usd = 20_000
+    broker.margins = {"SSS": 1_000, "TTT": 1_000, long.symbol: 50_000}
+    for plan in (high, nxt, long):
+        broker.quotes[plan.symbol] = _valid_quote(plan)
+    state = execute_tickers(
+        settings,
+        ["SSS", "TTT", long.symbol],
+        max_new_positions=2,
+        playbook=book,
+        broker=broker,
+        prompt_fn=broker.prompts.append,
+        now_fn=lambda: AFTER_OPEN,
+        monitor=False,
+        wait_for_open=False,
+        wait_for_moc=False,
+    )
+    assert broker.placed == ["SSS", "TTT"]
+    assert long.symbol in state.skipped
+
+
+def test_does_not_widen_a_side_that_already_leads_by_two(
+    playbook, settings, tmp_path, sample_plan
+) -> None:
+    settings = _settings(tmp_path, settings)
+    short = _short_plan(sample_plan, "SSS", 95.0)
+    long = sample_plan.model_copy(update={"confidence": 40.0})
+    book = playbook.model_copy(update={"picks": [short, long]})
+    write_playbook(book, tmp_path)
+    broker = FakeBroker()
+    save_ledger(
+        PositionLedger(
+            fills=[
+                LedgerFill(
+                    symbol="OLD1",
+                    side=Side.SELL,
+                    qty=10,
+                    fill_date=date(2024, 6, 21),
+                    order_ref=make_order_ref(date(2024, 6, 21), "OLD1"),
+                ),
+                LedgerFill(
+                    symbol="OLD2",
+                    side=Side.SELL,
+                    qty=20,
+                    fill_date=date(2024, 6, 21),
+                    order_ref=make_order_ref(date(2024, 6, 21), "OLD2"),
+                ),
+            ]
+        ),
+        tmp_path,
+    )
+    broker.positions = {"OLD1": -10, "OLD2": -20, "MANUAL": 50}
+    for plan in (short, long):
+        broker.quotes[plan.symbol] = _valid_quote(plan)
+    state = execute_tickers(
+        settings,
+        ["SSS", long.symbol],
+        playbook=book,
+        broker=broker,
+        prompt_fn=broker.prompts.append,
+        now_fn=lambda: AFTER_OPEN,
+        monitor=False,
+        wait_for_open=False,
+        wait_for_moc=False,
+    )
+    assert broker.placed == [long.symbol]
+    assert "SSS" in state.skipped
+    assert any("widen that gap" in decision.reason for decision in state.decisions)
+
+
+def test_a_lead_of_one_can_still_grow_to_two(
+    playbook, settings, tmp_path, sample_plan
+) -> None:
+    settings = _settings(tmp_path, settings)
+    first = _short_plan(sample_plan, "SSS", 95.0)
+    second = _short_plan(sample_plan, "TTT", 90.0)
+    third = _short_plan(sample_plan, "UUU", 80.0)
+    book = playbook.model_copy(update={"picks": [first, second, third]})
+    write_playbook(book, tmp_path)
+    broker = FakeBroker()
+    for plan in (first, second, third):
+        broker.quotes[plan.symbol] = _valid_quote(plan)
+    state = execute_tickers(
+        settings,
+        ["SSS", "TTT", "UUU"],
+        playbook=book,
+        broker=broker,
+        prompt_fn=broker.prompts.append,
+        now_fn=lambda: AFTER_OPEN,
+        monitor=False,
+        wait_for_open=False,
+        wait_for_moc=False,
+    )
+    assert broker.placed == ["SSS", "TTT"]
+    assert "UUU" in state.skipped
+
+
 def test_position_cap_does_not_transmit_lower_confidence(
     playbook, settings, tmp_path, sample_plan
 ) -> None:
