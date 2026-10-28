@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from swingtrading.models import Quote, Side, TradePlan
+from swingtrading.models import Quote, SetupType, Side, TradePlan
 
 
 def _finite(price: float | None) -> float | None:
@@ -50,11 +50,18 @@ def setup_still_valid(plan: TradePlan, quote: Quote) -> tuple[bool, str]:
             return False, f"price {px:.2f} is at/through the stop {plan.stop_price:.2f}"
 
     beyond = plan.skip_if.open_beyond
-    if beyond is not None:
+    if beyond is not None and plan.setup_type is SetupType.CONTINUATION:
+        # Past the entry in the trade direction: the breakout already ran.
         if plan.side is Side.BUY and px >= beyond:
             return False, f"open/last {px:.2f} already extended through {beyond:.2f}"
         if plan.side is Side.SELL and px <= beyond:
             return False, f"open/last {px:.2f} already extended through {beyond:.2f}"
+    elif beyond is not None and plan.setup_type is SetupType.MEAN_REVERSION:
+        # This level is the stop. A long is invalid only below it, a short only above it.
+        if plan.side is Side.BUY and px <= beyond:
+            return False, f"open/last {px:.2f} already through {beyond:.2f}"
+        if plan.side is Side.SELL and px >= beyond:
+            return False, f"open/last {px:.2f} already through {beyond:.2f}"
 
     if last is not None:
         if plan.side is Side.BUY and last >= plan.target_price:

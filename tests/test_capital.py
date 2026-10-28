@@ -1,6 +1,11 @@
 from __future__ import annotations
 
-from swingtrading.execute.capital import fallback_margin, fits_buying_power, usable_buying_power
+from swingtrading.execute.capital import (
+    fallback_margin,
+    fits_buying_power,
+    sleeve_remaining,
+    usable_buying_power,
+)
 from swingtrading.models import Side
 
 
@@ -8,6 +13,13 @@ def test_usable_buying_power_applies_reserve(settings) -> None:
     settings.bp_reserve_pct = 0.05
     assert usable_buying_power(10_000, settings) == 9_500
     assert usable_buying_power(float("inf"), settings) == float("inf")
+
+
+def test_each_side_gets_half_after_the_buffer(settings) -> None:
+    settings.bp_reserve_pct = 0.05
+    assert sleeve_remaining(10_000, 0, 0, settings) == 4_750
+    assert sleeve_remaining(10_000, 3_000, 1_000, settings) == 3_650
+    assert sleeve_remaining(float("inf"), 1_000, 1_000, settings) == float("inf")
 
 
 def test_fits_buying_power() -> None:

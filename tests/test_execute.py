@@ -613,7 +613,7 @@ def test_promotes_next_after_gap_skip(playbook, settings, tmp_path, sample_plan)
     broker = FakeBroker()
     broker.buying_power_usd = 10_000
     broker.margins[sample_plan.symbol] = 8_000
-    broker.margins["BBB"] = 8_000
+    broker.margins["BBB"] = 4_000
     beyond = sample_plan.skip_if.open_beyond
     bad = (beyond + 1) if beyond is not None and sample_plan.side is Side.BUY else (
         (beyond - 1) if beyond is not None else sample_plan.stop_price
@@ -646,7 +646,7 @@ def test_skips_expensive_name_and_places_next_that_fits(
     book = playbook.model_copy(update={"picks": [sample_plan, cheap]})
     write_playbook(book, tmp_path)
     broker = FakeBroker()
-    broker.buying_power_usd = 6_000
+    broker.buying_power_usd = 12_000
     broker.margins[sample_plan.symbol] = 20_000
     broker.margins["BBB"] = 5_000
     broker.quotes[sample_plan.symbol] = _valid_quote(sample_plan)
@@ -682,7 +682,7 @@ def test_does_not_transmit_more_than_buying_power(
     broker.margins["CCC"] = 3_000
     for symbol, plan in ((sample_plan.symbol, sample_plan), ("BBB", second), ("CCC", third)):
         broker.quotes[symbol] = _valid_quote(plan)
-    broker.fill_on_wait = [sample_plan.symbol, "CCC"]
+    broker.fill_on_wait = ["CCC"]
     state = execute_tickers(
         settings,
         [sample_plan.symbol, "BBB", "CCC"],
@@ -692,9 +692,10 @@ def test_does_not_transmit_more_than_buying_power(
         now_fn=lambda: AFTER_OPEN,
         wait_for_moc=False,
     )
-    assert sample_plan.symbol in broker.placed
+    assert sample_plan.symbol not in broker.placed
     assert "BBB" not in broker.placed
     assert "CCC" in broker.placed
+    assert sample_plan.symbol in state.skipped
     assert "BBB" in state.skipped
 
 
@@ -774,10 +775,11 @@ def test_lagging_side_that_does_not_fit_does_not_block_the_other(
     assert long.symbol in state.skipped
 
 
-def test_does_not_widen_a_side_that_already_leads_by_two(
+def test_open_playbook_shorts_consume_only_the_short_sleeve(
     playbook, settings, tmp_path, sample_plan
 ) -> None:
     settings = _settings(tmp_path, settings)
+    settings.bp_reserve_pct = 0.0
     short = _short_plan(sample_plan, "SSS", 95.0)
     long = sample_plan.model_copy(update={"confidence": 40.0})
     book = playbook.model_copy(update={"picks": [short, long]})
@@ -804,7 +806,11 @@ def test_does_not_widen_a_side_that_already_leads_by_two(
         ),
         tmp_path,
     )
+    broker.buying_power_usd = 10_000
     broker.positions = {"OLD1": -10, "OLD2": -20, "MANUAL": 50}
+    broker.quotes["OLD1"] = Quote(symbol="OLD1", open=400.0, last=400.0)
+    broker.quotes["OLD2"] = Quote(symbol="OLD2", open=400.0, last=400.0)
+    broker.margins = {"SSS": 1_000, long.symbol: 1_000}
     for plan in (short, long):
         broker.quotes[plan.symbol] = _valid_quote(plan)
     state = execute_tickers(
@@ -820,19 +826,22 @@ def test_does_not_widen_a_side_that_already_leads_by_two(
     )
     assert broker.placed == [long.symbol]
     assert "SSS" in state.skipped
-    assert any("widen that gap" in decision.reason for decision in state.decisions)
+    assert any("short buying power left" in decision.reason for decision in state.decisions)
 
 
-def test_a_lead_of_one_can_still_grow_to_two(
+def test_a_third_order_waits_for_side_buying_power(
     playbook, settings, tmp_path, sample_plan
 ) -> None:
     settings = _settings(tmp_path, settings)
+    settings.bp_reserve_pct = 0.0
     first = _short_plan(sample_plan, "SSS", 95.0)
     second = _short_plan(sample_plan, "TTT", 90.0)
     third = _short_plan(sample_plan, "UUU", 80.0)
     book = playbook.model_copy(update={"picks": [first, second, third]})
     write_playbook(book, tmp_path)
     broker = FakeBroker()
+    broker.buying_power_usd = 4_000
+    broker.margins = {"SSS": 1_000, "TTT": 1_000, "UUU": 1_000}
     for plan in (first, second, third):
         broker.quotes[plan.symbol] = _valid_quote(plan)
     state = execute_tickers(

@@ -3,8 +3,10 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
+from collections.abc import Callable
 from datetime import date, datetime, timedelta, timezone
-from typing import Protocol
+from typing import Protocol, TypeVar
 
 from swingtrading.ai.cost import CostGuard, estimate_ticker_cost, usage_cost
 from swingtrading.ai.prompts import EXTRACT_PROMPT, enrichment_prompt
@@ -14,6 +16,8 @@ from swingtrading.models import AIOverlay, TradePlan
 logger = logging.getLogger(__name__)
 
 _JSON_RE = re.compile(r"\{.*\}", re.DOTALL)
+_RETRYABLE_STATUSES = {"RESOURCE_EXHAUSTED", "UNAVAILABLE"}
+T = TypeVar("T")
 
 
 class SentimentClient(Protocol):
@@ -57,10 +61,42 @@ class GrokClient:
             )
         guard.add(estimate)
         prompt = enrichment_prompt(plan, as_of, self.settings.x_search_max_posts)
-        text, in_tok, out_tok, tools = self._search_call(prompt)
+        try:
+            text, in_tok, out_tok, tools = self._search_call(prompt)
+        except Exception as exc:
+            if not is_retryable_grok_error(exc):
+                raise
+            logger.error(
+                "Grok still unavailable for %s after %s attempts (%s). Overlay skipped.",
+                plan.symbol,
+                self.settings.grok_retry_attempts,
+                grok_status_name(exc),
+            )
+            return AIOverlay(
+                sentiment=0.0,
+                event_risk="none",
+                veto=False,
+                summary="Grok unavailable after retries; overlay skipped.",
+            )
         overlay = parse_overlay(text)
         if overlay is None:
-            text2, in2, out2, tools2 = self._extract_call(text)
+            try:
+                text2, in2, out2, tools2 = self._extract_call(text)
+            except Exception as exc:
+                if not is_retryable_grok_error(exc):
+                    raise
+                logger.error(
+                    "Grok still unavailable for %s after %s attempts (%s). Overlay skipped.",
+                    plan.symbol,
+                    self.settings.grok_retry_attempts,
+                    grok_status_name(exc),
+                )
+                return AIOverlay(
+                    sentiment=0.0,
+                    event_risk="none",
+                    veto=False,
+                    summary="Grok unavailable after retries; overlay skipped.",
+                )
             in_tok += in2
             out_tok += out2
             tools += tools2
@@ -84,20 +120,84 @@ class GrokClient:
         end = datetime.now(timezone.utc)
         start = end - timedelta(hours=self.settings.x_search_lookback_hours)
         tools = [web_search(), _x_search_tool(start, end)]
-        chat = self._sdk().chat.create(model=self.settings.grok_model, tools=tools)
-        chat.append(user(prompt))
-        response = chat.sample()
-        text = _content(response)
-        in_tok, out_tok = _tokens(response)
-        return text, in_tok, out_tok, 2
+        def once() -> tuple[str, int, int, int]:
+            chat = self._sdk().chat.create(model=self.settings.grok_model, tools=tools)
+            chat.append(user(prompt))
+            response = chat.sample()
+            return _content(response), *_tokens(response), 2
+
+        return call_with_retry(
+            once,
+            attempts=int(self.settings.grok_retry_attempts),
+            wait_seconds=float(self.settings.grok_retry_seconds),
+        )
 
     def _extract_call(self, notes: str) -> tuple[str, int, int, int]:
         from xai_sdk.chat import user
 
-        chat = self._sdk().chat.create(model=self.settings.grok_model)
-        chat.append(user(f"{EXTRACT_PROMPT}\n\nNOTES:\n{notes[:12000]}"))
-        response = chat.sample()
-        return _content(response), *_tokens(response), 0
+        def once() -> tuple[str, int, int, int]:
+            chat = self._sdk().chat.create(model=self.settings.grok_model)
+            chat.append(user(f"{EXTRACT_PROMPT}\n\nNOTES:\n{notes[:12000]}"))
+            response = chat.sample()
+            return _content(response), *_tokens(response), 0
+
+        return call_with_retry(
+            once,
+            attempts=int(self.settings.grok_retry_attempts),
+            wait_seconds=float(self.settings.grok_retry_seconds),
+        )
+
+
+def grok_status_name(exc: BaseException) -> str:
+    code = getattr(exc, "code", None)
+    if callable(code):
+        try:
+            status = code()
+            name = getattr(status, "name", None)
+            if name:
+                return str(name)
+        except Exception:  # noqa: BLE001
+            pass
+    text = str(exc).upper()
+    for name in _RETRYABLE_STATUSES:
+        if name in text:
+            return name
+    return exc.__class__.__name__
+
+
+def is_retryable_grok_error(exc: BaseException) -> bool:
+    """True for model capacity and transient unavailability, not for billing or bad requests."""
+    return grok_status_name(exc) in _RETRYABLE_STATUSES
+
+
+def call_with_retry(
+    fn: Callable[[], T],
+    *,
+    attempts: int = 4,
+    wait_seconds: float = 60.0,
+    sleep_fn: Callable[[float], object] = time.sleep,
+) -> T:
+    """Call fn again after capacity or rate-limit errors. The wait grows by one minute each time."""
+    tries = max(1, int(attempts))
+    last: BaseException | None = None
+    for attempt in range(1, tries + 1):
+        try:
+            return fn()
+        except Exception as exc:  # noqa: BLE001
+            if not is_retryable_grok_error(exc) or attempt == tries:
+                raise
+            last = exc
+            delay = float(wait_seconds) * attempt
+            logger.warning(
+                "Grok call refused (%s). Retry %s/%s in %.0f seconds.",
+                grok_status_name(exc),
+                attempt,
+                tries - 1,
+                delay,
+            )
+            sleep_fn(delay)
+    assert last is not None
+    raise last
 
 
 def parse_overlay(text: str) -> AIOverlay | None:

@@ -43,6 +43,8 @@ class Settings(BaseSettings):
     skip_gap_atr: float = 0.5
 
     grok_model: str = "grok-4.3"
+    grok_retry_attempts: int = 4
+    grok_retry_seconds: float = 60.0
     ai_budget_usd: float = 2.0
     x_search_max_posts: int = 30
     x_search_lookback_hours: int = 48

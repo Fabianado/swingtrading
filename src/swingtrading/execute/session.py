@@ -15,8 +15,9 @@ from swingtrading.brokers.ibkr import IBKRRetailBroker
 from swingtrading.brokers.protocol import Broker
 from swingtrading.config import Settings
 from swingtrading.data.rth import format_wait, moc_window_open, rth_has_opened, seconds_until_rth_open
-from swingtrading.execute.capital import fits_buying_power, usable_buying_power
+from swingtrading.execute.capital import fits_buying_power, sleeve_remaining
 from swingtrading.execute.ledger import (
+    close_qty,
     due_fills,
     fill_from_plan,
     held_fills,
@@ -34,7 +35,7 @@ from swingtrading.execute.store import (
     playbook_risk_usd,
     save_execution,
 )
-from swingtrading.execute.validate import has_gap_quote, setup_still_valid
+from swingtrading.execute.validate import has_gap_quote, reference_prices, setup_still_valid
 from swingtrading.models import (
     BracketHandle,
     ExecutionDecision,
@@ -71,18 +72,31 @@ def _pop_next_plan(
     return sell.pop(0)
 
 
-def _widens_side_gap(side: Side, longs: int, shorts: int) -> bool:
-    """True when this side already leads by 2 or more and another order would widen that."""
-    if side is Side.BUY:
-        return longs - shorts >= 2
-    return shorts - longs >= 2
+def _held_margin(fill: LedgerFill, broker: Broker, settings: Settings) -> float:
+    """Margin of one open playbook position. Manual positions are not passed in."""
+    shares = close_qty(fill, int(broker.position_qty(fill.symbol)))
+    if shares <= 0:
+        return 0.0
+    _gap, last = reference_prices(broker.quote(fill.symbol))
+    if last is None or last <= 0:
+        logger.warning("No price for %s; its margin is not counted against the side budget", fill.symbol)
+        return 0.0
+    value = shares * float(last)
+    pct = settings.short_margin_pct if fill.side is Side.SELL else settings.long_margin_pct
+    return value * float(pct)
 
 
-def _playbook_side_counts(fills: list[LedgerFill]) -> tuple[int, int]:
-    """Held playbook fills only. Manual account positions are not included."""
-    longs = sum(1 for fill in fills if fill.side is Side.BUY)
-    shorts = sum(1 for fill in fills if fill.side is Side.SELL)
-    return longs, shorts
+def _playbook_margin(fills: list[LedgerFill], broker: Broker, settings: Settings) -> tuple[float, float]:
+    """(long margin, short margin) for held playbook fills."""
+    long_used = 0.0
+    short_used = 0.0
+    for fill in fills:
+        cost = _held_margin(fill, broker, settings)
+        if fill.side is Side.BUY:
+            long_used += cost
+        else:
+            short_used += cost
+    return long_used, short_used
 
 
 def _default_now(timezone: str) -> datetime:
@@ -176,11 +190,18 @@ def execute_tickers(
 
     handles: dict[str, BracketHandle] = {}
     plans_by_symbol = {plan.symbol: plan for plan in plans}
-    remaining_bp = usable_buying_power(gateway.buying_power(), settings)
-    _say(f"Usable buying power ${remaining_bp:.0f} (after reserve)")
+    available = gateway.buying_power()
+    used_long, used_short = _playbook_margin(visible.fills, gateway, settings)
+    remaining_by_side = {
+        Side.BUY: sleeve_remaining(available, used_long, used_short, settings),
+        Side.SELL: sleeve_remaining(available, used_short, used_long, settings),
+    }
+    _say(
+        f"Buying power left ${remaining_by_side[Side.BUY]:.0f} long, "
+        f"${remaining_by_side[Side.SELL]:.0f} short "
+        f"(half of total, {settings.bp_reserve_pct:.0%} buffer)"
+    )
     placed = 0
-    open_long, open_short = _playbook_side_counts(visible.fills)
-    _say(f"Playbook positions: {open_long} long, {open_short} short")
     session_open = rth_has_opened(
         clock(),
         timezone=settings.rth_timezone,
@@ -206,15 +227,13 @@ def execute_tickers(
             if fallback is not None and has_gap_quote(fallback):
                 _say(f"{plan.symbol}: no TWS tape; using Yahoo open/last")
                 quote = fallback
-        decision, remaining_bp, committed = _prepare_one(
+        decision, remaining_by_side[plan.side], committed = _prepare_one(
             gateway,
             plan,
             handles,
             quote,
-            remaining_bp=remaining_bp,
+            remaining_bp=remaining_by_side[plan.side],
             slots_left=cap - placed,
-            open_long=open_long + placed_by_side[Side.BUY],
-            open_short=open_short + placed_by_side[Side.SELL],
         )
         state.decisions.append(decision)
         extra = f" {decision.qty} sh" if decision.qty else ""
@@ -325,8 +344,6 @@ def _prepare_one(
     *,
     remaining_bp: float,
     slots_left: int,
-    open_long: int = 0,
-    open_short: int = 0,
 ) -> tuple[ExecutionDecision, float, bool]:
     broken = invalid_bracket_reason(plan)
     if broken:
@@ -399,40 +416,22 @@ def _prepare_one(
             remaining_bp,
             False,
         )
-    if _widens_side_gap(plan.side, open_long, open_short):
-        logger.info(
-            "Skip %s: %s long and %s short already open or sent",
-            plan.symbol,
-            open_long,
-            open_short,
-        )
-        return (
-            ExecutionDecision(
-                symbol=plan.symbol,
-                action="skipped",
-                reason=(
-                    f"not transmitted; {open_long} long and {open_short} short already "
-                    f"open or sent, another {plan.side.value} would widen that gap"
-                ),
-                qty=plan.qty,
-                risk_usd=plan.risk_usd,
-            ),
-            remaining_bp,
-            False,
-        )
+    side_name = "long" if plan.side is Side.BUY else "short"
     if not fits_buying_power(remaining_bp, cost):
         logger.info(
-            "Skip %s: needs ~$%.0f, $%.0f buying power left; trying next name",
+            "Skip %s: needs ~$%.0f, $%.0f %s buying power left; trying next name",
             plan.symbol,
             cost,
             remaining_bp,
+            side_name,
         )
         return (
             ExecutionDecision(
                 symbol=plan.symbol,
                 action="skipped",
                 reason=(
-                    f"not transmitted; needs ~${cost:.0f} vs ${remaining_bp:.0f} buying power left"
+                    f"not transmitted; needs ~${cost:.0f} vs ${remaining_bp:.0f} "
+                    f"{side_name} buying power left"
                 ),
                 qty=plan.qty,
                 risk_usd=plan.risk_usd,
